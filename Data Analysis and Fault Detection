@@ -1,0 +1,371 @@
+
+# Induction Motor Imbalance Fault Detection
+# External 30g Test Generalization
+
+import numpy as np
+import pandas as pd
+
+# Visualization
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from glob import glob
+
+# Progress bars
+from tqdm import tqdm
+from tqdm.keras import TqdmCallback
+
+# Warnings
+import warnings
+warnings.filterwarnings("ignore")
+
+# Signal processing
+from scipy import signal
+
+# Scikit‑learn: preprocessing, splitting, resampling, metrics, models
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils import resample
+from sklearn.metrics import (
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+    classification_report,
+    precision_recall_fscore_support,
+)
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+
+# Deep learning (TensorFlow / Keras)
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Dense
+from tensorflow.keras.callbacks import EarlyStopping
+
+# 1. Load raw data for all classes
+
+print("=== Stage 1: Loading raw data ===")
+data_n         = read_all_csv(paths["normal"], "normal")
+data_6g        = read_all_csv(paths["6g"], "6g")
+data_10g       = read_all_csv(paths["10g"], "10g")
+data_15g       = read_all_csv(paths["15g"], "15g")
+data_20g       = read_all_csv(paths["20g"], "20g")
+data_25g       = read_all_csv(paths["25g"], "25g")
+data_35g       = read_all_csv(paths["35g"], "35g")      # 30g left out here
+
+print("\n=== Stage 1b: Loading 30g external data ===")
+data_30g = read_all_csv(paths["30g"], "30g_external")     # For final external test only!
+
+
+# 2. Downsample all classes (show progress)
+
+print("\n=== Stage 2: Downsampling all classes ===")
+step = 5000
+classes = [
+    ("normal", "data_n"),
+    ("6g", "data_6g"),
+    ("10g", "data_10g"),
+    ("15g", "data_15g"),
+    ("20g", "data_20g"),
+    ("25g", "data_25g"),
+    ("35g", "data_35g"),
+    ("30g_external", "data_30g")
+]
+for name, var in tqdm(classes, desc="Downsampling classes"):
+    locals()[var] = downSampler(locals()[var], 0, step)
+
+print("Downsampled shapes:")
+for name, var in classes:
+    print(f"{name}: {locals()[var].shape}")
+
+
+# 3. FFT feature extraction (show progress)
+
+print("\n=== Stage 3: FFT autocorrelation ===")
+for name, var in tqdm(classes, desc="FFT classes"):
+    locals()[var] = FFT(locals()[var])
+
+for name, var in classes:
+    locals()[var] = locals()[var].iloc[:, :15]   # Only 15 columns/features
+
+
+# 4. Label and concatenate TRAINING data (exclude 30g!)
+
+print("\n=== Stage 4: Building labels and concatenating (excluding 30g) ===")
+y_normal   = pd.DataFrame(np.zeros(len(data_n), dtype=int))
+y_imb_6g   = pd.DataFrame(np.ones(len(data_6g), dtype=int))
+y_imb_10g  = pd.DataFrame(np.ones(len(data_10g), dtype=int))
+y_imb_15g  = pd.DataFrame(np.ones(len(data_15g), dtype=int))
+y_imb_20g  = pd.DataFrame(np.ones(len(data_20g), dtype=int))
+y_imb_25g  = pd.DataFrame(np.ones(len(data_25g), dtype=int))
+y_imb_35g  = pd.DataFrame(np.ones(len(data_35g), dtype=int))
+
+y_train = pd.concat(
+    [y_normal,
+     y_imb_6g, y_imb_10g, y_imb_15g, y_imb_20g,
+     y_imb_25g, y_imb_35g],
+    ignore_index=True
+)
+data_train = pd.concat(
+    [data_n,
+     data_6g, data_10g, data_15g, data_20g,
+     data_25g, data_35g],
+    ignore_index=True
+)
+
+y_train.columns = ["y"]
+data_train["y"] = y_train["y"]
+
+print("\nClass counts before balancing:")
+print(data_train["y"].value_counts())
+
+
+# 5. Balance classes (normal vs imbalance)
+
+print("\n=== Stage 5: Balancing classes (excluding 30g) ===")
+class_0 = data_train[data_train["y"] == 0]
+class_1 = data_train[data_train["y"] == 1]
+
+class_1_down = resample(
+    class_1,
+    replace=False,
+    n_samples=len(class_0),
+    random_state=42
+)
+
+balanced_data = pd.concat([class_0, class_1_down])
+print("Balanced counts:\n", balanced_data["y"].value_counts())
+
+plt.figure(figsize=(6, 4))
+sns.barplot(x=["Normal", "Imbalance"], y=balanced_data["y"].value_counts().values)
+plt.title("Balanced Class Distribution (excl. 30g)")
+plt.show()
+
+
+# 6. Train/test split and scaling for internal test
+
+print("\n=== Stage 6: Train/test split and scaling ===")
+X = balanced_data.iloc[:, :-1].values
+y = balanced_data["y"].values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.25, shuffle=True, random_state=42
+)
+
+scaler = StandardScaler()
+X_train = scaler.fit_transform(X_train)
+X_test  = scaler.transform(X_test)
+
+print("X_train:", X_train.shape, "X_test:", X_test.shape)
+
+# Prepare external 30g test set (label = 1)
+X_30g = scaler.transform(data_30g.values)     # Transformation only, no fit!
+y_30g = np.ones(len(data_30g), dtype=int)
+
+
+# 7. Training and evaluation (SVM)
+
+print("\n=== Stage 7: Training SVM (grid search) ===")
+C_values = [0.1, 1, 10, 100]
+gamma_values = [0.001, 0.01, 0.1, 1]
+
+param_grid = {
+    "C": C_values,
+    "gamma": gamma_values,
+    "kernel": ["rbf"],
+}
+
+grid = GridSearchCV(
+    SVC(random_state=1),
+    param_grid,
+    cv=3,
+    n_jobs=-1,
+    scoring="accuracy",
+)
+grid.fit(X_train, y_train)
+
+print("Best params:", grid.best_params_)
+print("Best CV accuracy:", grid.best_score_)
+
+best_svm = grid.best_estimator_
+best_svm_acc = best_svm.score(X_test, y_test)
+print("Best SVM Test Acc (internal):", best_svm_acc)
+best_svm_acc_30g = best_svm.score(X_30g, y_30g)
+print("Best SVM Test Acc (external, 30g):", best_svm_acc_30g)
+
+# SVM confusion matrices
+svm_preds_best = best_svm.predict(X_test)
+svm_preds_30g = best_svm.predict(X_30g)
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_test, svm_preds_best, labels=[0, 1]),
+                      display_labels=["Normal", "Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("Best SVM Confusion Matrix (Internal test)")
+plt.show()
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_30g, svm_preds_30g, labels=[1]),
+                      display_labels=["Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("Best SVM Confusion Matrix (External 30g Only)")
+plt.show()
+
+
+# 8. kNN, choose best k
+
+k_values = list(range(2, 8))
+test_accs = []
+test_accs_30g = []
+for k in k_values:
+    print(f"\n=== Stage 8: Training kNN (k={k}) ===")
+    knn = KNeighborsClassifier(n_neighbors=k)
+    knn.fit(X_train, y_train)
+    test_acc = knn.score(X_test, y_test)
+    test_acc_30g = knn.score(X_30g, y_30g)
+    test_accs.append(test_acc)
+    test_accs_30g.append(test_acc_30g)
+    print("kNN Test Acc (internal):", test_acc)
+    print("kNN Test Acc (external, 30g):", test_acc_30g)
+
+plt.figure(figsize=(6, 4))
+plt.plot(k_values, test_accs, marker="o", label="Test (internal)")
+plt.plot(k_values, test_accs_30g, marker="x", label="Test (external, 30g)")
+plt.xlabel("k (n_neighbors)")
+plt.ylabel("Test Accuracy")
+plt.title("kNN Test Accuracy vs k")
+plt.xticks(k_values)
+plt.ylim(0.8, 1.0)
+plt.grid(True)
+plt.legend()
+plt.show()
+
+best_k = k_values[np.argmax(test_accs)]
+best_knn = KNeighborsClassifier(n_neighbors=best_k)
+best_knn.fit(X_train, y_train)
+best_knn_acc = best_knn.score(X_test, y_test)
+best_knn_acc_30g = best_knn.score(X_30g, y_30g)
+print(f"Best kNN (k={best_k}) Test Accuracy (internal): {best_knn_acc:.4f}")
+print(f"Best kNN (k={best_k}) Test Accuracy (external 30g): {best_knn_acc_30g:.4f}")
+
+# kNN confusion matrices
+knn_preds_best = best_knn.predict(X_test)
+knn_preds_30g = best_knn.predict(X_30g)
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_test, knn_preds_best, labels=[0, 1]),
+                      display_labels=["Normal", "Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("Best kNN Confusion Matrix (Internal Test)")
+plt.show()
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_30g, knn_preds_30g, labels=[1]),
+                      display_labels=["Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("Best kNN Confusion Matrix (External 30g Only)")
+plt.show()
+
+
+# 9. DNN (train as before, test on both sets)
+
+print("\n=== Stage 9: Training DNN ===")
+early_stop = EarlyStopping(monitor="val_loss", patience=3, restore_best_weights=True)
+model = Sequential([
+    Dense(32, activation="relu", input_shape=(X_train.shape[1],)),
+    Dense(64, activation="relu"),
+    Dense(32, activation="relu"),
+    Dense(1, activation="sigmoid"),
+])
+model.compile(optimizer=keras.optimizers.Adam(learning_rate=0.002),
+              loss="binary_crossentropy", metrics=["accuracy"])
+history = model.fit(
+    X_train, y_train,
+    epochs=30,
+    validation_split=0.2,
+    callbacks=[early_stop, TqdmCallback(verbose=0)],
+    verbose=0,
+)
+test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
+test_loss_30g, test_acc_30g = model.evaluate(X_30g, y_30g, verbose=0)
+print("DNN Test Accuracy (internal):", test_acc)
+print("DNN Test Accuracy (external, 30g):", test_acc_30g)
+
+plt.figure(figsize=(6, 4))
+plt.plot(history.history["accuracy"], label="train acc")
+plt.plot(history.history["val_accuracy"], label="val acc")
+plt.title("DNN Accuracy")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(6, 4))
+plt.plot(history.history["loss"], label="train loss")
+plt.plot(history.history["val_loss"], label="val loss")
+plt.title("DNN Loss")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+dnn_preds_best = (model.predict(X_test, verbose=0) > 0.5).astype(int).ravel()
+dnn_preds_30g = (model.predict(X_30g, verbose=0) > 0.5).astype(int).ravel()
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_test, dnn_preds_best, labels=[0, 1]),
+                      display_labels=["Normal", "Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("DNN Confusion Matrix (Internal Test)")
+plt.show()
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_30g, dnn_preds_30g, labels=[1]),
+                      display_labels=["Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("DNN Confusion Matrix (External 30g Only)")
+plt.show()
+
+
+# 10. Generative: Gaussian Naive Bayes
+
+print("\n=== Extra: Gaussian Naive Bayes ===")
+gnb = GaussianNB()
+gnb.fit(X_train, y_train)
+gnb_acc = gnb.score(X_test, y_test)
+gnb_acc_30g = gnb.score(X_30g, y_30g)
+print("GNB Test Accuracy (internal):", gnb_acc)
+print("GNB Test Accuracy (external, 30g):", gnb_acc_30g)
+gnb_preds_best = gnb.predict(X_test)
+gnb_preds_30g = gnb.predict(X_30g)
+
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_test, gnb_preds_best, labels=[0, 1]),
+                      display_labels=["Normal", "Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("GaussianNB Confusion Matrix (Internal Test)")
+plt.show()
+plt.figure(figsize=(5, 4))
+ConfusionMatrixDisplay(confusion_matrix(y_30g, gnb_preds_30g, labels=[1]),
+                      display_labels=["Imbalance"]).plot(
+    cmap="viridis", values_format="d", ax=plt.gca())
+plt.title("GaussianNB Confusion Matrix (External 30g Only)")
+plt.show()
+
+
+# 11. Final Model Comparison (best versions, accuracy on both internal & external test)
+
+print("\n=== Model Accuracy Comparison (internal & external test) ===")
+model_accuracies_internal = {
+    f"SVM (C={grid.best_params_['C']}, γ={grid.best_params_['gamma']})": best_svm_acc,
+    f"kNN (k={best_k})": best_knn_acc,
+    "DNN": test_acc,
+    "GaussianNB": gnb_acc,
+}
+model_accuracies_external = {
+    f"SVM (C={grid.best_params_['C']}, γ={grid.best_params_['gamma']})": best_svm_acc_30g,
+    f"kNN (k={best_k})": best_knn_acc_30g,
+    "DNN": test_acc_30g,
+    "GaussianNB": gnb_acc_30g,
+}
+plt.figure(figsize=(8, 5))
+plt.bar(model_accuracies_internal.keys(), model_accuracies_internal.values(), alpha=0.7, label="Internal test")
+plt.bar(model_accuracies_external.keys(), model_accuracies_external.values(), alpha=0.4, label="External 30g")
+plt.ylim(0.8, 1.0)
+plt.ylabel("Test Accuracy")
+plt.title("Model Accuracy Comparison (Internal vs. External 30g)")
+plt.legend()
+plt.show()
